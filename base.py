@@ -542,7 +542,9 @@ class SpeakerNet(nn.Module):
         self.eval_interval = eval_interval
         self.log_dir = log_dir
 
-    def train(self, dataloader, num_epoch=num_epoch, step_num=0):
+    def train(self, dataloader, trials_loader, num_epoch=num_epoch, 
+              step_num=0, mode="norm2", eval_L=eval_L, num_eval=num_eval,
+              eval_batch_size=30, embed_norm=True):
         modelst = []
         for epoch in range(num_epoch):
             self.net.train()
@@ -567,6 +569,9 @@ class SpeakerNet(nn.Module):
                 modeldir = "snapshot-epoch-%03d.model" % (epoch + 1)
                 modeldir = os.path.join(self.log_dir, modeldir)
                 torch.save(self.net.state_dict(), modeldir)
+                self.evaluate(trials_loader, step_num, mode=mode,
+                              eval_L=eval_L, num_eval=num_eval,
+                              batch_size=eval_batch_size, embed_norm=embed_norm)
                 self.lr_step.step()
                 modelst.append(modeldir)
         return modelst, step_num, loss.item(), prec1, prec5
@@ -600,12 +605,12 @@ class SpeakerNet(nn.Module):
                 trials_feat[file[i]] = feat[j: j + num_eval].clone()
         return trials_feat
 
-    def eval(self, trials_loader, step_num, mode="norm2",
-             L=eval_L, num_eval=num_eval,
-             batch_size=30, embed_norm=True, trials_feat=None):
+    def evaluate(self, trials_loader, step_num, mode="norm2",
+                 eval_L=eval_L, num_eval=num_eval,
+                 batch_size=30, embed_norm=True, trials_feat=None):
 
         if trials_feat is None:
-            trials_feat = self._prefeat(trials_loader, L, num_eval,
+            trials_feat = self._prefeat(trials_loader, eval_L, num_eval,
                                         batch_size, embed_norm)
         all_scores = []
         all_labels = []
