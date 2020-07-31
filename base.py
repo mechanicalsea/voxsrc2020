@@ -622,8 +622,8 @@ class SpeakerNet(nn.Module):
             for i in range(len(label)):
                 enroll_embed = trials_feat[enroll[i]]
                 test_embed = trials_feat[test[i]]
-                score = calculate_score(enroll_embed.to(device),
-                                        test_embed.to(device),
+                score = calculate_score(enroll_embed.to(self.device),
+                                        test_embed.to(self.device),
                                         mode=mode)
                 all_scores.append(score)
                 all_trials.append([enroll[i], test[i]])
