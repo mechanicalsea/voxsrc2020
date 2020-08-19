@@ -99,7 +99,10 @@ device = "cuda:2"
 log_dir = "/workspace/rwang/competition/voxsrc2020/logs/exp-22"
 
 __all__ = ["load_train", "load_trial", "loadWAV",
-           "SpeakerNet", "ResNetSE34L", "AMSoftmax"]
+           "SpeakerNet", "ResNetSE34L", "AMSoftmax",
+           "AAMSoftmax", "SoftmaxLoss",
+           "SEBasicBlock", "StatsPool", "SAP",
+           "calculate_eer", "calculate_score", "evaluate"]
 
 
 ############
@@ -164,7 +167,8 @@ class vox2trials(Dataset):
 
 
 class voxsampler(Sampler):
-    """Indices Resampler for dataset.
+    """Indices Resampler for dataset that ensure there is no repeated
+    speakers in a batch.
     """
 
     def __init__(self, data_source: pd.DataFrame, speaker_id: dict,
@@ -231,8 +235,13 @@ def loadWAV(filename, L=32240, evalmode=True, num_eval=10):
 
 def load_train(trainlst, traindir, maptrain5994, L=L,
                batch_size=batch_size, num_worker=num_worker,
-               max_utt_per_spk=max_utt_per_spk):
-    def load_train_wav(path): return loadWAV(path, L=L, evalmode=False)
+               max_utt_per_spk=max_utt_per_spk, load_wav=None):
+    """dataloader for training dataset via voxsampler.
+    """
+    if load_wav is None:
+        def load_train_wav(path): return loadWAV(path, L=L, evalmode=False)
+    else:
+        load_train_wav = load_wav
     df_train = pd.read_csv(trainlst, sep=" ", header=None,
                            names=["speaker", "file"])
     df_train["file"] = df_train["file"].apply(lambda x: traindir + x)
@@ -248,6 +257,11 @@ def load_train(trainlst, traindir, maptrain5994, L=L,
 
 def load_trial(testlst, testdir,
                batch_size=batch_size, num_worker=num_worker):
+    """dataloader via vox2trials.
+    Format: label enroll test
+        where label is 0 or 1, enroll is the path of enrollment, 
+        test is the path of test.
+    """
     df_trials = pd.read_csv(testlst, sep=" ", header=None, names=[
                             "label", "enrollment", "test"])
     df_trials["enrollment"] = df_trials["enrollment"].apply(
@@ -314,6 +328,57 @@ class SELayer(nn.Module):
         y = self.avg_pool(x).view(b, c)
         y = self.fc(y).view(b, c, 1, 1)
         return x * y
+
+
+class StatsPool(nn.Module):
+
+    def __init__(self, floor=1e-10, bessel=False):
+        super(StatsPool, self).__init__()
+        self.floor = floor
+        self.bessel = bessel
+
+    def forward(self, x):
+        '''
+        input: size (batch, seq_len, input_features[1, *])
+        outpu: size (batch, output_features[1, *])
+        '''
+        means = torch.mean(x, dim=1)
+        t = x.shape[1]
+        if self.bessel:
+            t = t - 1
+        residuals = x - means.unsqueeze(1)
+        numerator = torch.sum(residuals**2, dim=1)
+        stds = torch.sqrt(torch.clamp(numerator, min=self.floor)/t)
+        x = torch.cat([means, stds], dim=1)
+        return x
+
+
+class SAP(nn.Module):
+    '''Self attention pooling layer
+    '''
+
+    def __init__(self, in_dim):
+        super().__init__()
+        self.in_dim = in_dim
+        self.sap_linear = nn.Linear(in_dim, in_dim)
+        self.attention = self.new_parameter(in_dim, 1)
+        self.softmax = nn.Softmax(dim=1)
+
+    def new_parameter(self, *size):
+        out = nn.Parameter(torch.FloatTensor(*size))
+        nn.init.xavier_normal_(out)
+        return out
+
+    def forward(self, x):
+        '''Self attention pooling over time/frames
+        @x (tensor): batch * L * D
+        '''
+        # self attention pooling over time/frames
+        h = torch.tanh(self.sap_linear(x))  # batch * L * D' (D' = D)
+        w = torch.matmul(h, self.attention).squeeze(dim=2)  # batch * L
+        w = self.softmax(w).unsqueeze(2)  # batch * L * 1
+        x = torch.sum(x * w, dim=1)  # batch * D
+        return x
 
 
 class ResNetSE(nn.Module):
@@ -443,6 +508,55 @@ def accuracy(output, target, topk=(1,)):
     return res
 
 
+class AAMSoftmax(nn.Module):
+    def __init__(self,
+                 in_feats,
+                 n_classes=10,
+                 m=0.2,
+                 s=30,
+                 easy_margin=False):
+        super(AAMSoftmax, self).__init__()
+        self.m = m
+        self.s = s
+        self.in_feats = in_feats
+        self.weight = torch.nn.Parameter(torch.FloatTensor(
+            n_classes, in_feats), requires_grad=True)
+        self.ce = nn.CrossEntropyLoss()
+        nn.init.xavier_normal_(self.weight, gain=1)
+
+        self.easy_margin = easy_margin
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+
+        # make the function cos(theta+m) monotonic decreasing while theta in [0°,180°]
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+
+        print('Initialized AMSoftmax m = %.3f s = %.3f' % (self.m, self.s))
+
+    def forward(self, x, label=None):
+        # cos(theta)
+        cosine = F.linear(F.normalize(x), F.normalize(self.weight))
+        # cos(theta + m)
+        sine = torch.sqrt((1.0 - torch.pow(cosine, 2)).clamp(0, 1))
+        phi = cosine * self.cos_m - sine * self.sin_m
+
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where((cosine - self.th) > 0, phi, cosine - self.mm)
+
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, label.view(-1, 1), 1)
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output = output * self.s
+
+        loss = self.ce(output, label)
+        prec1, prec5 = accuracy(output.detach().cpu(),
+                                label.detach().cpu(), topk=(1, 5))
+        return loss, prec1, prec5
+
+
 class AMSoftmax(nn.Module):
     def __init__(self, in_feats, n_classes=10, m=0.2, s=30):
         super(AMSoftmax, self).__init__()
@@ -482,6 +596,22 @@ class AMSoftmax(nn.Module):
         return loss, prec1, prec5
 
 
+class SoftmaxLoss(nn.Module):
+    def __init__(self, in_feats, n_classes=10):
+        super(SoftmaxLoss, self).__init__()
+        self.criterion = torch.nn.CrossEntropyLoss()
+        self.fc = nn.Linear(in_feats, n_classes)
+
+    def forward(self, x, label=None):
+        x = self.fc(x)
+        if label is None:
+            return x
+        loss = self.criterion(x, label)
+        prec1, prec5 = accuracy(
+            x.detach().cpu(), label.detach().cpu(), topk=(1, 5))
+        return loss, prec1, prec5
+
+
 def calculate_score(enroll_feat, test_feat, num_eval=10, mode="norm2"):
     if mode is "norm2":
         dist = F.pairwise_distance(
@@ -496,7 +626,7 @@ def calculate_score(enroll_feat, test_feat, num_eval=10, mode="norm2"):
     return score
 
 
-def calculate_eer(y, y_score, pos):
+def calculate_eer(y, y_score, pos=1):
     """Calculate Equal Error Rate (EER).
 
     Parameters
@@ -522,19 +652,96 @@ def calculate_eer(y, y_score, pos):
 # 模型训练
 #########
 
+def evaluate(embed_net, trials_loader, mode="norm2",
+             eval_L=300, num_eval=6, device=None,
+             batch_size=30, embed_norm=True, trials_feat=None, load_wav=None):
+    """Evaluate function for embedding network.
+    device = "cuda:2"
+    eval_L = 48240
+    mode = "norm2"
+    eval_batch_size = 30
+    embed_norm = True
+    ret = evaluate(net, trials_loader, mode="cosine",
+                   eval_L=eval_L, num_eval=num_eval, device=device,
+                   batch_size=eval_batch_size, embed_norm=embed_norm)
+    """
+    def _prefeat(embed_net, trials_loader, L, num_eval, batch_size, 
+                 embed_norm, device, load_wav=None):
+        if load_wav is None:
+            def load_trial_wav(path): return loadWAV(
+                path, L=L, evalmode=True, num_eval=num_eval)
+        else:
+            load_trial_wav = load_wav
+        wav_file = [[trials_loader.dataset[i]["enroll"],
+                     trials_loader.dataset[i]["test"]]
+                    for i in range(len(trials_loader.dataset))]
+        wav_file = sorted(list(set(np.concatenate(wav_file).tolist())))
+        trials = waveform(wav_file, load_trial_wav)
+
+        def collate_fn(batch):
+            """collect from a batch of VoxWave Dataset."""
+            file = [item["file"] for item in batch]
+            wave = torch.cat([item["wave"] for item in batch], dim=0)
+            return {"file": file, "wave": wave}
+
+        trialoader = DataLoader(trials, batch_size=batch_size,
+                                num_workers=5, collate_fn=collate_fn, 
+                                shuffle=False)
+        trials_feat = {}
+        with torch.no_grad():
+            embed_net.to(device)
+            embed_net.eval()
+            for data in tqdm(trialoader, total=len(trialoader)):
+                file = data["file"]
+                wave = data["wave"].to(device)
+                feat = embed_net(wave)
+                if embed_norm is True:
+                    feat = F.normalize(feat, p=2, dim=1).detach().cpu()
+                for i, j in enumerate(range(0, feat.shape[0], num_eval)):
+                    trials_feat[file[i]] = feat[j: j + num_eval].clone()
+        return trials_feat
+    
+    if trials_feat is None:
+        trials_feat = _prefeat(embed_net, trials_loader, eval_L, num_eval,
+                               batch_size, embed_norm, device, load_wav)
+    all_scores = []
+    all_labels = []
+    all_trials = []
+    for trial in tqdm(trials_loader, total=len(trials_loader)):
+        label = trial["label"]
+        enroll = trial["enroll"]
+        test = trial["test"]
+        for i in range(len(label)):
+            enroll_embed = trials_feat[enroll[i]]
+            test_embed = trials_feat[test[i]]
+            score = calculate_score(enroll_embed.to(device),
+                                    test_embed.to(device),
+                                    mode=mode, num_eval=num_eval)
+            all_scores.append(score)
+            all_trials.append([enroll[i], test[i]])
+        all_labels.extend(label.numpy().tolist())
+    all_scores = np.array(all_scores)
+    all_labels = np.array(all_labels)
+    eer, thresh = calculate_eer(all_labels, all_scores, 1)
+    return eer, thresh, all_scores, all_labels, all_trials, trials_feat
+
 
 class SpeakerNet(nn.Module):
     def __init__(self,
                  device=device,
                  log_dir=log_dir,
                  eval_interval=eval_interval,
+                 optimizer="Adam",
                  lr=lr,
                  gamma=gamma,
                  top=None,
                  net=None):
         super(SpeakerNet, self).__init__()
         self.net = nn.Sequential(net, top).to(device)
-        self.optimizer = optim.Adam(self.net.parameters(), lr=lr)
+        if optimizer == "Adam":
+            self.optimizer = optim.Adam(self.net.parameters(), lr=lr)
+        else:
+            self.optimizer = optim.SGD(self.net.parameters(), lr=lr, momentum=0.9, weight_decay=1e-5)
         self.lr_step = optim.lr_scheduler.ExponentialLR(
             self.optimizer, gamma=gamma)
         self.TBoard = SummaryWriter(log_dir=log_dir)
@@ -542,13 +749,15 @@ class SpeakerNet(nn.Module):
         self.eval_interval = eval_interval
         self.log_dir = log_dir
 
-    def train(self, dataloader, trials_loader, num_epoch=num_epoch, 
+    def train(self, dataloader, trials_loader, num_epoch=num_epoch, str_epoch=0,
               step_num=0, mode="norm2", eval_L=eval_L, num_eval=num_eval,
-              eval_batch_size=30, embed_norm=True):
+              eval_batch_size=30, embed_norm=True, eval_load_wav=None):
         modelst = []
-        for epoch in range(num_epoch):
+        for epoch in range(str_epoch, num_epoch):
             self.net.train()
-            for i_step, batch in tqdm(enumerate(dataloader), total=dataloader.sampler.num_file//dataloader.batch_size):
+            pbar = tqdm(enumerate(dataloader), desc="Epoch %03d" % (epoch + 1),
+                        total=dataloader.sampler.num_file//dataloader.batch_size)
+            for i_step, batch in pbar:
                 self.optimizer.zero_grad()
                 label = batch["label"].to(self.device)
                 inp = batch["input"].to(self.device)
@@ -561,24 +770,32 @@ class SpeakerNet(nn.Module):
                     'Metrics/train_loss', loss.item(), step_num)
                 self.TBoard.add_scalar(
                     'Metrics/lr', self.lr_step.get_last_lr()[0], step_num)
-                self.TBoard.add_scalar('Metrics/top1_acc', prec1, step_num)
-                self.TBoard.add_scalar('Metrics/top5_acc', prec5, step_num)
+                self.TBoard.add_scalar('Metrics/top1_acc', prec1.item(), step_num)
+                self.TBoard.add_scalar('Metrics/top5_acc', prec5.item(), step_num)
+                # pbar
+                pbar.set_postfix({"step": step_num, 
+                                  "train_loss": loss.item(),
+                                  "train_acc": prec1.item()})
 
             if (epoch + 1) % self.eval_interval == 0:
                 self.net.eval()
                 modeldir = "snapshot-epoch-%03d.model" % (epoch + 1)
                 modeldir = os.path.join(self.log_dir, modeldir)
                 torch.save(self.net.state_dict(), modeldir)
-                self.evaluate(trials_loader, step_num, mode=mode,
+                self.evaluate(trials_loader, epoch + 1, mode=mode,
                               eval_L=eval_L, num_eval=num_eval,
-                              batch_size=eval_batch_size, embed_norm=embed_norm)
+                              batch_size=eval_batch_size, embed_norm=embed_norm,
+                              load_wav=eval_load_wav)
                 self.lr_step.step()
                 modelst.append(modeldir)
         return modelst, step_num, loss.item(), prec1, prec5
 
-    def _prefeat(self, trials_loader, L, num_eval, batch_size, embed_norm):
-        def load_trial_wav(path): return loadWAV(
-            path, L=L, evalmode=True, num_eval=num_eval)
+    def _prefeat(self, trials_loader, L, num_eval, batch_size, embed_norm, load_wav=None):
+        if load_wav is None:
+            def load_trial_wav(path): return loadWAV(
+                path, L=L, evalmode=True, num_eval=num_eval)
+        else:
+            load_trial_wav = load_wav
         wav_file = [[trials_loader.dataset[i]["enroll"],
                      trials_loader.dataset[i]["test"]]
                     for i in range(len(trials_loader.dataset))]
@@ -593,25 +810,26 @@ class SpeakerNet(nn.Module):
 
         trialoader = DataLoader(trials, batch_size=batch_size,
                                 num_workers=5, collate_fn=collate_fn, shuffle=False)
-        self.net.eval()
         trials_feat = {}
-        for data in tqdm(trialoader, total=len(trialoader)):
-            file = data["file"]
-            wave = data["wave"].to(self.device)
-            feat = self.net[0](wave)
-            if embed_norm is True:
-                feat = F.normalize(feat, p=2, dim=1).detach().cpu()
-            for i, j in enumerate(range(0, feat.shape[0], num_eval)):
-                trials_feat[file[i]] = feat[j: j + num_eval].clone()
+        with torch.no_grad():
+            self.net.eval()
+            for data in tqdm(trialoader, total=len(trialoader)):
+                file = data["file"]
+                wave = data["wave"].to(self.device)
+                feat = self.net[0](wave)
+                if embed_norm is True:
+                    feat = F.normalize(feat, p=2, dim=1).detach().cpu()
+                for i, j in enumerate(range(0, feat.shape[0], num_eval)):
+                    trials_feat[file[i]] = feat[j: j + num_eval].clone()
         return trials_feat
 
     def evaluate(self, trials_loader, step_num, mode="norm2",
                  eval_L=eval_L, num_eval=num_eval,
-                 batch_size=30, embed_norm=True, trials_feat=None):
+                 batch_size=30, embed_norm=True, trials_feat=None, load_wav=None):
 
         if trials_feat is None:
             trials_feat = self._prefeat(trials_loader, eval_L, num_eval,
-                                        batch_size, embed_norm)
+                                        batch_size, embed_norm, load_wav)
         all_scores = []
         all_labels = []
         all_trials = []
@@ -624,7 +842,7 @@ class SpeakerNet(nn.Module):
                 test_embed = trials_feat[test[i]]
                 score = calculate_score(enroll_embed.to(self.device),
                                         test_embed.to(self.device),
-                                        mode=mode)
+                                        mode=mode, num_eval=num_eval)
                 all_scores.append(score)
                 all_trials.append([enroll[i], test[i]])
             all_labels.extend(label.numpy().tolist())
@@ -638,6 +856,7 @@ class SpeakerNet(nn.Module):
         loaded_state = torch.load(modeldir)
         if strict is True:
             self.net.load_state_dict(loaded_state)
+            print("Loaded model successfully.")
         else:
             self_state = self.net.state_dict()
             for name, param in loaded_state.items():
